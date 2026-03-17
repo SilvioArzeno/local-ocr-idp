@@ -6,8 +6,8 @@ import os
 from models.schemas import PromptDefinition, PromptResult
 
 OLLAMA_URL  = os.getenv("OLLAMA_URL", "http://localhost:11434")
-MODEL       = os.getenv("OLLAMA_MODEL", "gemma3:12b")      # extraction + normalization
-OCR_MODEL   = os.getenv("OLLAMA_OCR_MODEL", "gemma3:4b")   # vision OCR pass only
+MODEL       = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")      # structured field extraction
+OCR_MODEL   = os.getenv("OLLAMA_OCR_MODEL", "gemma3:4b")    # vision OCR pass only
 TIMEOUT     = int(os.getenv("OLLAMA_TIMEOUT", "600"))
 
 # Standard lab acronyms we extract server-side from all pages
@@ -56,7 +56,7 @@ _NAME_TO_ACRONYM: dict[str, str] = {
     "ast": "AST", "ast (sgot)": "AST", "sgot": "AST", "aspartate aminotransferase": "AST",
     "alt": "ALT", "alt (sgpt)": "ALT", "sgpt": "ALT", "alanine aminotransferase": "ALT",
     "pt": "PT", "prothrombin time": "PT",
-    "ptt": "PTT", "partial thromboplastin time": "PTT",
+    "ptt": "PTT", "partial thromboplastin time": "PTT", "aptt": "PTT", "a ptt": "PTT",
     "inr": "INR",
     "glucose": "Glucose",
     "hba1c": "HbA1C", "hemoglobin a1c": "HbA1C", "haemoglobin a1c": "HbA1C",
@@ -66,6 +66,25 @@ _NAME_TO_ACRONYM: dict[str, str] = {
     "bhcg": "BHCG", "hcg": "BHCG", "beta hcg": "BHCG",
     "hepc": "HepC", "hep c": "HepC", "hepatitis c": "HepC",
 }
+
+
+def _merge_lab_entry(lab_key: str, lab_val, merged: dict) -> None:
+    """Add a single lab key/value pair to merged after normalisation and validation."""
+    if lab_val is None:
+        return
+    if str(lab_val).strip().lower() in _NOT_FOUND:
+        return
+    if not _is_numeric(lab_val):
+        return
+    num = _coerce_numeric(lab_val)
+    if num is None:
+        return
+    canon = _NAME_TO_ACRONYM.get(lab_key.lower().strip(), lab_key)
+    validated = _validate_lab(canon, num)
+    if validated is not None:
+        merged[canon] = validated
+    elif canon not in _LAB_RANGES:
+        merged[canon] = num
 
 
 def _validate_lab(acronym: str, num: float) -> float | None:
@@ -133,20 +152,36 @@ def _extract_balanced_array(text: str) -> str | None:
     return None
 
 
+def _deloop_ocr(text: str) -> str:
+    """
+    Truncate OCR output at the point a hallucination loop is detected.
+    A loop is flagged when the same 20-char line stem (min 4 chars) repeats more than 3 times.
+    Short stems like '%', 'g/dL', '0.3' repeat naturally in lab tables and are ignored.
+    """
+    lines = text.split('\n')
+    stem_counts: dict[str, int] = {}
+    result = []
+    for line in lines:
+        stem = line.strip()[:20]
+        if len(stem) >= 4:
+            stem_counts[stem] = stem_counts.get(stem, 0) + 1
+            if stem_counts[stem] > 3:
+                break
+        result.append(line)
+    return '\n'.join(result)
+
+
+def _normalize_date(val: str) -> str:
+    """Convert any recognised date format to MM/DD/YYYY."""
+    t = _parse_date_tuple(val.strip())
+    if t is None:
+        return val
+    year, month, day = t
+    return f"{month:02d}/{day:02d}/{year}"
+
+
 def _build_ocr_prompt(doc_type: str) -> str:
-    return f"""You are an OCR system. Read the image and output ONLY the text that is physically visible in the image.
-
-Do NOT invent, hallucinate, infer, or repeat any content that is not actually shown in the image.
-Do NOT output these instructions or any part of this prompt.
-
-For laboratory result tables (columns: Test Name | Result | Flag | Reference Range | Units):
-- Output each row as: TestName: RESULT UNITS (ref: REFERENCE_RANGE)
-- RESULT is the patient's measured value — a single number, not a range like "4.0-11.0"
-- Reference ranges (two numbers separated by a dash) are NOT patient results
-- Read decimal points carefully from column alignment
-
-For all other content (names, dates, IDs, notes), transcribe exactly as written.
-Output ONLY the transcribed document text, nothing else."""
+    return "Transcribe all text visible in this image exactly as written. Output only the transcribed text."
 
 
 def _build_text_extraction_prompt(
@@ -188,61 +223,6 @@ Rules:
 ]"""
 
 
-def _compact_page(raw: str, prompts: list[PromptDefinition]) -> str:
-    """
-    Extract a compact summary of a page for the normalization model.
-    Only use parsed JSON if it contains proper {"key": ..., "value": ...} extraction objects.
-    Otherwise fall back to raw text so scalar fields (name, DOB, date) are preserved.
-    """
-    items = _parse_json_array(raw)
-    # Only trust the parsed array if it looks like our extraction format
-    if items and isinstance(items[0], dict) and "key" in items[0]:
-        return json.dumps(items, separators=(',', ':'))
-    # Fall back to raw text — preserves all fields including patient_name / date_of_birth
-    return raw[:2000] + ("…" if len(raw) > 2000 else "")
-
-
-def _build_normalization_prompt(
-    prompts: list[PromptDefinition],
-    doc_type: str,
-    page_summaries: list[str],
-) -> str:
-    definitions = "\n".join([
-        f"{i+1}. key=\"{p.key}\" | type={p.type} | question: {p.question}"
-        for i, p in enumerate(prompts)
-    ])
-    pages_text = "\n\n".join([
-        f"=== PAGE {i+1} ===\n{text}" for i, text in enumerate(page_summaries)
-    ])
-    keys_list = ", ".join(f'"{p.key}"' for p in prompts)
-    example = json.dumps([
-        {"key": p.key, "value": "best value found across ALL pages", "confidence": "high"}
-        for p in prompts
-    ], indent=2)
-    TEST_ACRONYMS = "WBC, RBC, Platelets, HGB, NA, Creat, K, AST, ALT, PT, PTT, INR, Glucose, HbA1C, T3, T4, TSH, HIV, CD4, BHCG, HepC"
-    return f"""You are a data consolidation assistant. A {doc_type} was split into {len(page_summaries)} pages and each page was scanned independently. Your job is to consolidate ALL pages into ONE final answer per field.
-
-Fields to extract:
-{definitions}
-
-Per-page extractions (ALL pages — read every single one):
-{pages_text}
-
-CRITICAL OUTPUT RULES:
-- Return a JSON ARRAY (starts with [ ends with ]) with exactly {len(prompts)} objects
-- Each object must have exactly: "key", "value", "confidence"
-- Keys must be exactly: {keys_list} — in that order
-- confidence -> "high", "medium", "low", or "not_found"
-- NO markdown fences, NO comments, NO extra text — output ONLY the JSON array
-
-FIELD-SPECIFIC RULES:
-- patient_name: Find the name repeated most consistently across pages. Strip IDs, DOBs, and encounter info. Convert "LASTNAME, Firstname" → "Firstname Lastname".
-- date_of_birth: MM/DD/YYYY. Fix malformed dates (e.g. "1/05/1971" → "01/05/1971").
-- collected_date: MM/DD/YYYY. Use the specimen collected date (not signed/reviewed date).
-- test_results: Merge numeric lab values from ALL pages into ONE flat JSON object using ONLY these acronyms as keys: {TEST_ACRONYMS}. Only include a key if an actual numeric value was found (not null, not "not found"). Example: {{"WBC": 5.5, "RBC": 4.73, "HGB": 11.7, "HbA1C": 6.2}}
-
-Required output format:
-{example}"""
 
 
 def _try_add(merged: dict, acronym: str, raw_val) -> None:
@@ -323,6 +303,25 @@ def _merge_from_raw(raw: str, merged: dict) -> None:
                             acronym = _NAME_TO_ACRONYM.get(test_name_lo)
                         if acronym:
                             _try_add(merged, acronym, item["Current Result and Flag"])
+                    elif item.get("key") == "test_results":
+                        test_val = item.get("value")
+                        if isinstance(test_val, dict):
+                            # {"WBC": 3.77, "AST": 17, ...}
+                            for k, v in test_val.items():
+                                if k not in ("confidence", "units", "flag"):
+                                    _merge_lab_entry(k, v, merged)
+                        elif isinstance(test_val, list):
+                            for entry in test_val:
+                                if not isinstance(entry, dict):
+                                    continue
+                                if "test" in entry and "result" in entry:
+                                    # {"test": "AST (SGOT)", "result": 17, "units": "U/L"}
+                                    _merge_lab_entry(str(entry["test"]), entry["result"], merged)
+                                else:
+                                    # {"WBC": 3.77, "confidence": "medium"}
+                                    for k, v in entry.items():
+                                        if k not in ("confidence", "units", "flag"):
+                                            _merge_lab_entry(k, v, merged)
                     elif "name" in item or "acronym" in item:
                         # CMP format: {"name": "AST (SGOT)", "acronym": "AST", "value": "17"}
                         raw_acronym = str(item.get("acronym", "")).strip()
@@ -435,103 +434,9 @@ def _parse_json_array(raw: str) -> list[dict] | None:
     return None
 
 
-def _repair_json(text: str) -> str:
-    """
-    Fix the most common model JSON malformations:
-    - Unquoted keys:          confidence: → "confidence":
-    - Unquoted bare values:   : not_found → : "not_found"
-    Already-quoted keys are safe: lookbehind prevents re-quoting "key":.
-    """
-    # Quote unquoted keys (not preceded by " or a word char)
-    text = re.sub(r'(?<!["\w])([a-zA-Z_]\w*)\s*(?=:)', r'"\1"', text)
-    # Quote unquoted bare-word values after colon (skip null/true/false and numbers)
-    text = re.sub(
-        r'(?<=:)\s*([a-zA-Z_][a-zA-Z0-9_ ]*[a-zA-Z0-9_])\b(?=\s*[,}\]])',
-        lambda m: f' "{m.group(1)}"' if m.group(1) not in ('null', 'true', 'false') else f' {m.group(1)}',
-        text,
-    )
-    return text
-
-
-def _parse_normalization_response(raw: str, prompts: list[PromptDefinition]) -> list[dict] | None:
-    """
-    Parse normalization output. Handles multiple model response formats:
-    1. Expected array:        [{"key": "patient_name", "value": "...", "confidence": "high"}, ...]
-    2. Flat object:           {"patient_name": "...", "collected_date": "...", ...}
-    3. Array of page objects: [{"patient_name": "...", ...}, {"patient_name": "...", ...}, ...]
-       (model echoed per-page summaries instead of consolidating — we consolidate ourselves)
-    """
-    cleaned = re.sub(r"```json|```", "", raw).strip()
-    cleaned = re.sub(r"//[^\n]*", "", cleaned)
-    cleaned = _repair_json(cleaned)
-    prompt_keys = {p.key for p in prompts}
-
-    # --- Try expected array format first ---
-    fixed = re.sub(r'("key"\s*:\s*"[^"]+"\s*,\s*)(\[)', r'\1"value": \2', cleaned)
-    arr_match = re.search(r"\[.*\]", fixed, re.DOTALL)
-    if arr_match:
-        try:
-            items = json.loads(arr_match.group(0))
-            if isinstance(items, list) and items and isinstance(items[0], dict):
-                # Format 1: expected [{key, value, confidence}, ...]
-                if "key" in items[0]:
-                    return items
-                # Format 3: array of per-page objects — consolidate by taking first non-null value
-                if prompt_keys & set(items[0].keys()):
-                    consolidated: dict = {}
-                    for page_obj in items:
-                        if not isinstance(page_obj, dict):
-                            continue
-                        for k, v in page_obj.items():
-                            if k not in prompt_keys or k in consolidated:
-                                continue
-                            if v is not None and str(v).lower().strip() not in _NOT_FOUND:
-                                consolidated[k] = v
-                    return [
-                        {
-                            "key": p.key,
-                            "value": consolidated.get(p.key),
-                            "confidence": "high" if consolidated.get(p.key) is not None else "not_found",
-                        }
-                        for p in prompts
-                    ]
-        except json.JSONDecodeError:
-            pass
-
-    # --- Fallback: flat object {"patient_name": val, "date_of_birth": val, ...} ---
-    obj_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if obj_match:
-        try:
-            obj = json.loads(obj_match.group(0))
-            if isinstance(obj, dict) and prompt_keys & set(obj.keys()):
-                return [
-                    {
-                        "key": p.key,
-                        "value": obj.get(p.key),
-                        "confidence": "high" if obj.get(p.key) is not None else "not_found",
-                    }
-                    for p in prompts
-                ]
-        except json.JSONDecodeError:
-            pass
-
-    return None
-
-
-async def extract_from_page(
-    image_b64: str,
-    prompts: list[PromptDefinition],
-    doc_type: str,
-) -> str:
-    """
-    Two-pass extraction:
-      Pass 1 (vision)  — OCR: transcribe all text from the page image.
-      Pass 2 (text)    — Extract: pull structured fields from the transcription.
-    Separating OCR from extraction gives the model a simpler task each time,
-    dramatically improving accuracy over single-pass vision+JSON extraction.
-    """
-    # ── Pass 1: OCR (vision model reads the image) ────────────────────────────
-    ocr_payload = {
+async def ocr_page(image_b64: str, doc_type: str) -> str:
+    """Pass 1 — vision model transcribes the page image to text."""
+    payload = {
         "model": OCR_MODEL,
         "prompt": _build_ocr_prompt(doc_type),
         "images": [image_b64],
@@ -539,14 +444,22 @@ async def extract_from_page(
         "options": {
             "temperature": 0.0,
             "num_ctx": int(os.getenv("OLLAMA_CTX", "4096")),
+            "num_predict": int(os.getenv("OLLAMA_OCR_MAX_TOKENS", "2048")),
         },
     }
-    ocr_data = await asyncio.to_thread(_call_ollama, ocr_payload)
-    transcribed = ocr_data.get("response", "")
+    data = await asyncio.to_thread(_call_ollama, payload)
+    transcribed = _deloop_ocr(data.get("response", ""))
     print(f"[ollama OCR]\n{transcribed}\n", flush=True)
+    return transcribed
 
-    # ── Pass 2: Extraction (text-only, no image) ──────────────────────────────
-    extract_payload = {
+
+async def extract_from_transcription(
+    transcribed: str,
+    prompts: list[PromptDefinition],
+    doc_type: str,
+) -> str:
+    """Pass 2 — text model extracts structured fields from transcribed text."""
+    payload = {
         "model": MODEL,
         "prompt": _build_text_extraction_prompt(prompts, doc_type, transcribed),
         "stream": False,
@@ -555,8 +468,8 @@ async def extract_from_page(
             "num_ctx": int(os.getenv("OLLAMA_EXTRACT_CTX", "8192")),
         },
     }
-    extract_data = await asyncio.to_thread(_call_ollama, extract_payload)
-    raw = extract_data.get("response", "")
+    data = await asyncio.to_thread(_call_ollama, payload)
+    raw = data.get("response", "")
     print(f"[ollama extraction]\n{raw}\n", flush=True)
     return raw
 
@@ -608,10 +521,6 @@ def _extract_scalar_from_pages(key: str, raw_page_responses: list[str]) -> str |
     print(f"[scalar extract] {key}: candidates={candidates}", flush=True)
     if not candidates:
         return None
-    # For collected_date, prefer the last found — on multi-date documents earlier pages
-    # often have older order/encounter dates; later pages have the actual specimen date.
-    if key == "collected_date":
-        return candidates[-1][1]
     return candidates[0][1]
 
 
@@ -620,82 +529,30 @@ async def normalize_results(
     prompts: list[PromptDefinition],
     doc_type: str,
 ) -> list[PromptResult]:
-    """Consolidate all raw per-page text extractions into one clean result."""
-    page_summaries = [_compact_page(r, prompts) for r in raw_page_responses]
-
-    # Merge test_results server-side — LLM format is unreliable
+    """Consolidate per-page extractions using server-side logic only (no LLM call)."""
     merged_tests = _merge_test_results(raw_page_responses)
     print(f"[server-side test_results] {merged_tests}", flush=True)
 
-    payload = {
-        "model": MODEL,
-        "prompt": _build_normalization_prompt(prompts, doc_type, page_summaries),
-        "stream": False,
-        "options": {
-            "temperature": 0.0,
-            "num_ctx": int(os.getenv("OLLAMA_NORMALIZE_CTX", "32768")),
-        },
-    }
-
-    data = await asyncio.to_thread(_call_ollama, payload)
-    raw = data.get("response", "")
-    print(f"[ollama normalization response]\n{raw}\n", flush=True)
-
-    items = _parse_normalization_response(raw, prompts)
-    prompt_map = {p.key: p for p in prompts}
-
-    if items is None:
-        result_list = [
-            PromptResult(key=p.key, question=p.question, value=None, confidence="not_found")
-            for p in prompts
-        ]
-    else:
-        result_map: dict[str, PromptResult] = {}
-        for item in items:
-            key = item.get("key", "")
-            prompt_def = prompt_map.get(key)
-            if prompt_def:
-                value = item.get("value")
-                if key == "patient_name":
-                    value = _fix_patient_name(value)
-                result_map[key] = PromptResult(
-                    key=key,
-                    question=prompt_def.question,
-                    value=value,
-                    confidence=item.get("confidence", "low"),
-                )
-        result_list = [
-            result_map.get(p.key, PromptResult(
-                key=p.key, question=p.question, value=None, confidence="not_found"
+    result_list = []
+    for p in prompts:
+        if p.key == "test_results":
+            result_list.append(PromptResult(
+                key="test_results",
+                question=p.question,
+                value=merged_tests if merged_tests else None,
+                confidence="high" if merged_tests else "not_found",
             ))
-            for p in prompts
-        ]
-
-    # Override test_results with server-side merged values
-    test_prompt = next((p for p in prompts if p.key == "test_results"), None)
-    if test_prompt and merged_tests:
-        for i, r in enumerate(result_list):
-            if r.key == "test_results":
-                result_list[i] = PromptResult(
-                    key="test_results",
-                    question=test_prompt.question,
-                    value=merged_tests,
-                    confidence="high",
-                )
-                break
-
-    # Fill in any scalar fields the LLM left null using server-side regex scan
-    SCALAR_KEYS = {"patient_name", "date_of_birth", "collected_date"}
-    for i, r in enumerate(result_list):
-        if r.key in SCALAR_KEYS and r.value is None:
-            fallback = _extract_scalar_from_pages(r.key, raw_page_responses)
-            if fallback:
-                value = _fix_patient_name(fallback) if r.key == "patient_name" else fallback
-                result_list[i] = PromptResult(
-                    key=r.key,
-                    question=r.question,
-                    value=value,
-                    confidence="medium",
-                )
+        else:
+            val = _extract_scalar_from_pages(p.key, raw_page_responses)
+            if val and p.key == "patient_name":
+                val = _fix_patient_name(val)
+            elif val and p.type == "date":
+                val = _normalize_date(val)
+            result_list.append(PromptResult(
+                key=p.key,
+                question=p.question,
+                value=val,
+                confidence="medium" if val else "not_found",
+            ))
 
     return result_list

@@ -1,16 +1,14 @@
 ﻿from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-import asyncio
 import json
 import os
 
 from models.schemas import ExtractionResponse, PromptDefinition
-from services.ollama import extract_from_page, normalize_results
+from services.ollama import extract_from_transcription, normalize_results, ocr_page
 from services.pdf import image_to_base64, pdf_to_base64_pages
 
 router = APIRouter(prefix="/api", tags=["extraction"])
 
 MAX_BYTES    = int(os.getenv("MAX_FILE_MB", 20)) * 1024 * 1024
-MAX_CONCURRENCY = int(os.getenv("MAX_PAGE_CONCURRENCY", 4))
 ALLOWED_TYPES = {
     "application/pdf",
     "image/png",
@@ -48,14 +46,17 @@ async def extract(
     else:
         pages = image_to_base64(file_bytes)
 
-    # ── Extract per page then merge (bounded concurrency to protect Ollama) ──
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    # ── Phase 1: OCR all pages with the vision model (one model load) ──────────
+    transcriptions = []
+    for page in pages:
+        transcriptions.append(await ocr_page(page, document_type))
 
-    async def bounded_extract(page):
-        async with sem:
-            return await extract_from_page(page, prompt_list, document_type)
-
-    all_page_results = await asyncio.gather(*[bounded_extract(page) for page in pages])
+    # ── Phase 2: Extract from all transcriptions with the text model ────────────
+    all_page_results = []
+    for transcribed in transcriptions:
+        all_page_results.append(
+            await extract_from_transcription(transcribed, prompt_list, document_type)
+        )
     final_results = await normalize_results(all_page_results, prompt_list, document_type)
     successful    = sum(1 for r in final_results if r.confidence != "not_found")
 
